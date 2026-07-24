@@ -15,9 +15,9 @@ ACLED_EMAIL    = os.environ.get("ACLED_EMAIL", "")
 ACLED_PASSWORD = os.environ.get("ACLED_PASSWORD", "")
 ACLED_BASE     = "https://acleddata.com/api"
 
-# Session for cookie-based ACLED auth (new system post-Sep 2025)
-ACLED_SESSION  = None
-ACLED_SESSION_TS = 0
+ACCESS_TOKEN    = None
+REFRESH_TOKEN   = None
+TOKEN_EXPIRY    = 0
 
 CACHE = {}
 CACHE_TTL = 900  # 15 min
@@ -30,61 +30,84 @@ def get_cached(key):
 def set_cached(key, data):
     CACHE[key] = {"data": data, "ts": time.time()}
 
-def get_acled_session():
-    global ACLED_SESSION, ACLED_SESSION_TS
-    if ACLED_SESSION and time.time() - ACLED_SESSION_TS < 82800:
-        return ACLED_SESSION
+def get_access_token():
+    global ACCESS_TOKEN, REFRESH_TOKEN, TOKEN_EXPIRY
     if not ACLED_EMAIL or not ACLED_PASSWORD:
         return None
+    now = time.time()
+    # Refresh if expired
+    if ACCESS_TOKEN and now < TOKEN_EXPIRY - 300:
+        return ACCESS_TOKEN
+    # Try refresh token first
+    if REFRESH_TOKEN and now < TOKEN_EXPIRY + 14*86400:
+        try:
+            res = requests.post(
+                "https://acleddata.com/oauth/token",
+                data={"refresh_token": REFRESH_TOKEN, "grant_type": "refresh_token", "client_id": "acled"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15
+            )
+            if res.status_code == 200:
+                d = res.json()
+                ACCESS_TOKEN  = d.get("access_token")
+                REFRESH_TOKEN = d.get("refresh_token", REFRESH_TOKEN)
+                TOKEN_EXPIRY  = now + d.get("expires_in", 86400)
+                return ACCESS_TOKEN
+        except:
+            pass
+    # Full login via OAuth password grant
     try:
-        s = requests.Session()
-        # Cookie-based login (new ACLED auth system)
-        res = s.post(
-            "https://acleddata.com/wp-login.php",
+        res = requests.post(
+            "https://acleddata.com/oauth/token",
             data={
-                "log": ACLED_EMAIL,
-                "pwd": ACLED_PASSWORD,
-                "wp-submit": "Log+In",
-                "redirect_to": "https://acleddata.com/api/acled/read?limit=1",
-                "testcookie": "1"
+                "username":   ACLED_EMAIL,
+                "password":   ACLED_PASSWORD,
+                "grant_type": "password",
+                "client_id":  "acled",
+                "scope":      "authenticated"
             },
-            headers={"User-Agent": "TRIDENT/1.0"},
-            timeout=15,
-            allow_redirects=True
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15
         )
-        if res.status_code == 200 and "wordpress_logged_in" in str(s.cookies):
-            ACLED_SESSION = s
-            ACLED_SESSION_TS = time.time()
-            return s
-        # Fallback: try the old token endpoint just in case
-        res2 = s.post(
-            "https://acleddata.com/api/authenticate/",
-            json={"email": ACLED_EMAIL, "password": ACLED_PASSWORD},
-            timeout=10
-        )
-        if res2.status_code == 200:
-            ACLED_SESSION = s
-            ACLED_SESSION_TS = time.time()
-            return s
+        if res.status_code == 200:
+            d = res.json()
+            ACCESS_TOKEN  = d.get("access_token")
+            REFRESH_TOKEN = d.get("refresh_token")
+            TOKEN_EXPIRY  = now + d.get("expires_in", 86400)
+            print(f"[ TRIDENT ] ACLED OAuth token obtained, expires in {d.get('expires_in')}s")
+            return ACCESS_TOKEN
+        else:
+            print(f"[ TRIDENT ] ACLED OAuth failed: {res.status_code} {res.text[:200]}")
     except Exception as e:
-        print(f"ACLED auth error: {e}")
+        print(f"[ TRIDENT ] ACLED OAuth error: {e}")
     return None
 
 def acled_get(endpoint, params=None):
-    s = get_acled_session()
-    if not s:
+    token = get_access_token()
+    if not token:
         return None
     try:
-        r = s.get(f"{ACLED_BASE}{endpoint}", params=params, timeout=20)
+        r = requests.get(
+            f"{ACLED_BASE}{endpoint}",
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=20
+        )
         if r.status_code == 200:
             return r.json()
+        print(f"[ TRIDENT ] ACLED request error: {r.status_code} {r.text[:100]}")
     except Exception as e:
-        print(f"ACLED request error: {e}")
+        print(f"[ TRIDENT ] ACLED request exception: {e}")
     return None
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "TRIDENT Geo-Intelligence", "acled_configured": bool(ACLED_EMAIL and ACLED_PASSWORD)})
+    return jsonify({
+        "status": "ok",
+        "service": "TRIDENT Geo-Intelligence",
+        "acled_configured": bool(ACLED_EMAIL and ACLED_PASSWORD),
+        "acled_token_active": bool(ACCESS_TOKEN and time.time() < TOKEN_EXPIRY)
+    })
 
 @app.route("/acled/events")
 def acled_events():
@@ -94,8 +117,8 @@ def acled_events():
     data = acled_get("/acled/read", {
         "limit": 100,
         "fields": "event_id_cnty|event_date|event_type|sub_event_type|actor1|actor2|country|admin1|location|latitude|longitude|fatalities|notes|source",
-        "date_range_start": (datetime.datetime.utcnow() - datetime.timedelta(days=30)).strftime("%Y-%m-%d"),
-        "date_range_end": datetime.datetime.utcnow().strftime("%Y-%m-%d"),
+        "event_date": f"{(datetime.datetime.utcnow() - datetime.timedelta(days=30)).strftime('%Y-%m-%d')}|{datetime.datetime.utcnow().strftime('%Y-%m-%d')}",
+        "event_date_where": "BETWEEN"
     })
     if not data:
         return jsonify({"error": "ACLED not configured or auth failed", "events": [], "count": 0}), 200
@@ -112,8 +135,8 @@ def acled_summary():
     data = acled_get("/acled/read", {
         "limit": 500,
         "fields": "event_type|country|fatalities",
-        "date_range_start": (datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
-        "date_range_end": datetime.datetime.utcnow().strftime("%Y-%m-%d"),
+        "event_date": f"{(datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')}|{datetime.datetime.utcnow().strftime('%Y-%m-%d')}",
+        "event_date_where": "BETWEEN"
     })
     if not data:
         return jsonify({"error": "ACLED not configured or auth failed", "summary": []}), 200
@@ -137,10 +160,9 @@ def threat_summary():
     data = acled_get("/acled/read", {
         "limit": 200,
         "fields": "event_type|country|fatalities|latitude|longitude|event_date",
-        "date_range_start": (datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
-        "date_range_end": datetime.datetime.utcnow().strftime("%Y-%m-%d"),
+        "event_date": f"{(datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')}|{datetime.datetime.utcnow().strftime('%Y-%m-%d')}",
+        "event_date_where": "BETWEEN"
     })
-    acled_data = {}
     if data:
         events = data.get("data", [])
         total_fatalities = sum(int(e.get("fatalities", 0) or 0) for e in events)
@@ -215,4 +237,4 @@ def geopolitical_news():
 
 if __name__ == "__main__":
     print("[ TRIDENT ] Geo-Intelligence Service starting on port 5003")
-    app.run(host="127.0.0.1", port=5003, debug=False)
+    app.run(host="127.0.0.1", port=5003, debug=False
